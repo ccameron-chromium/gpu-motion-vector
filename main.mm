@@ -159,16 +159,12 @@ void LoadShaders() {
     std::string string = buffer.str();
     const char* cSource = string.c_str();
 
-    NSError* error = nil;
-    NSString* source = [[NSString alloc] initWithCString:cSource
-                                                encoding:NSASCIIStringEncoding];
-    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-    library = [device newLibraryWithSource:source
-                                   options:options
-                                     error:&error];
-    if (error) {
-      NSLog(@"Failed to load library: %@", error);
-      exit(1);
+    NSError *error = NULL;
+    NSString *libraryFile = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:@"metallib"];
+    library = [device newLibraryWithFile:libraryFile error:&error];
+    if (!library || error) {
+        NSLog(@"Failed to load library: %@", error);
+        exit(1);
     }
   }
 

@@ -45,8 +45,8 @@ float computeSumOfAbsoluteDifference(texture2d<float> a,
   for (uint x = 0; x < kBlockWidth; ++x) {
     for (uint y = 0; y < kBlockHeight; ++y) {
       float2 delta = float2(x, y);
-      float a_sample = a.sample(s, a_texcoord + delta).g;
-      float b_sample = b.sample(s, b_texcoord + delta).g;
+      float a_sample = a.sample(s, a_texcoord + delta).r;
+      float b_sample = b.sample(s, b_texcoord + delta).r;
       total += abs(a_sample - b_sample);
     }
   }

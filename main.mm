@@ -9,8 +9,8 @@
 #include <vector>
 
 const MTLPixelFormat pixelFormat = MTLPixelFormatBGRA8Unorm;
-const int width = 1280;
-const int height = 720;
+unsigned int width = 1280;
+unsigned int height = 720;
 const int kBlockWidth = 16;
 const int kBlockHeight = 16;
 
@@ -24,8 +24,8 @@ id<MTLRenderPipelineState> reconstructRenderPipelineState = nil;
 id<MTLRenderPipelineState> motionVectorSearchRenderPipelineState = nil;
 id<MTLRenderPipelineState> motionVectorDrawRenderPipelineState = nil;
 
-size_t texture_index = 0;
-size_t previous_texture_index = 0;
+size_t frame_index = 0;
+size_t previous_frame_index = 0;
 
 enum DisplayMode {
   DMPreviousFrame,
@@ -35,9 +35,7 @@ enum DisplayMode {
 DisplayMode display_mode = DMCurrentFrame;
 bool display_motion_vectors = false;
 
-size_t num_frames = 16;
-IOSurfaceRef io_surfaces[16];
-id<MTLTexture> textures[16];
+std::vector<id<MTLTexture>> frames;
 
 id<MTLTexture> motion_vector_texture;
 
@@ -126,7 +124,7 @@ id<MTLTexture> IOSurfaceToTexture(IOSurfaceRef io_surface) {
   [tex_desc setMipmapLevelCount:1];
   [tex_desc setArrayLength:1];
   [tex_desc setSampleCount:1];
-  [tex_desc setStorageMode:MTLStorageModePrivate];
+  [tex_desc setStorageMode:MTLStorageModeManaged];
   id<MTLTexture> texture = [device newTextureWithDescriptor:tex_desc
                                                   iosurface:io_surface
                                                       plane:0];
@@ -267,8 +265,8 @@ void ComputeMotionVectorUsingDraw() {
     [encoder setVertexBytes:positions
                      length:sizeof(positions)
                     atIndex:0];
-    [encoder setFragmentTexture:textures[texture_index] atIndex:0];
-    [encoder setFragmentTexture:textures[previous_texture_index] atIndex:1];
+    [encoder setFragmentTexture:frames[frame_index] atIndex:0];
+    [encoder setFragmentTexture:frames[previous_frame_index] atIndex:1];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle
                 vertexStart:0
                 vertexCount:6];
@@ -305,15 +303,15 @@ void Draw() {
     switch (display_mode) {
       case DMCurrentFrame:
         [encoder setRenderPipelineState:renderPipelineState];
-        [encoder setFragmentTexture:textures[texture_index] atIndex:0];
+        [encoder setFragmentTexture:frames[frame_index] atIndex:0];
         break;
       case DMPreviousFrame:
         [encoder setRenderPipelineState:renderPipelineState];
-        [encoder setFragmentTexture:textures[previous_texture_index] atIndex:0];
+        [encoder setFragmentTexture:frames[previous_frame_index] atIndex:0];
         break;
       case DMReconstructedFrame:
         [encoder setRenderPipelineState:reconstructRenderPipelineState];
-        [encoder setFragmentTexture:textures[previous_texture_index] atIndex:0];
+        [encoder setFragmentTexture:frames[previous_frame_index] atIndex:0];
         [encoder setFragmentTexture:motion_vector_texture atIndex:1];
         break;
     }
@@ -357,11 +355,11 @@ void Draw() {
 
   switch ([characters characterAtIndex:0]) {
     case ' ':
-      previous_texture_index = texture_index;
-      texture_index = (texture_index + 1) % num_frames;
+      previous_frame_index = frame_index;
+      frame_index = (frame_index + 1) % frames.size();
       printf("Reconstructing frame %lu using frame %lu\n",
-          texture_index,
-          (texture_index + num_frames - 1) % num_frames);
+          frame_index,
+          (frame_index + frames.size() - 1) % frames.size());
       ComputeMotionVectorUsingDraw();
       Draw();
       break;
@@ -388,26 +386,127 @@ void Draw() {
 }
 @end
 
+bool StrEndsWith(const char* str, const char* suffix) {
+  size_t lenstr = strlen(str);
+  size_t lensuffix = strlen(suffix);
+  if (lensuffix >  lenstr)
+    return false;
+  return strncmp(str + lenstr - lensuffix, suffix, lensuffix) == 0;
+}
+
+void LoadYUVTextures(const char* filepath, unsigned int count) {
+  const unsigned int chroma_shift = 1;
+
+  unsigned int align = (1 << chroma_shift) - 1;
+  unsigned int w = (width + align) & ~align;
+  unsigned int h = (height + align) & ~align;
+
+  unsigned int bytes_per_row_align = 32;
+  unsigned int bytes_per_row = w;
+  bytes_per_row = (bytes_per_row + bytes_per_row_align - 1) & ~(bytes_per_row_align - 1);
+
+  MTLTextureDescriptor* tex_desc = [MTLTextureDescriptor new];
+  [tex_desc setTextureType:MTLTextureType2D];
+  [tex_desc setUsage:MTLTextureUsageShaderRead];
+  [tex_desc setPixelFormat:MTLPixelFormatR8Unorm];
+  [tex_desc setWidth:width];
+  [tex_desc setHeight:height];
+  [tex_desc setDepth:1];
+  [tex_desc setMipmapLevelCount:1];
+  [tex_desc setArrayLength:1];
+  [tex_desc setSampleCount:1];
+  [tex_desc setStorageMode:MTLStorageModePrivate];
+
+  FILE* file = fopen(filepath, "rb");
+
+  id <MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+  id <MTLBlitCommandEncoder> blitCommandEncoder = [commandBuffer blitCommandEncoder];
+
+  // Load just the Y data for each image.
+  for (unsigned int i = 0; i < count; ++i) {
+    id<MTLTexture> frame = [device newTextureWithDescriptor:tex_desc];
+
+    const unsigned int bytespp = 1; // bytes per pixel
+
+    id<MTLBuffer> staging_buffer =
+        [device newBufferWithLength:h * bytes_per_row
+                            options:MTLResourceStorageModeShared];
+    char* ptr = static_cast<char*>([staging_buffer contents]);
+
+    auto LoadPlanes = [&]() {
+      for (int plane : {0, 1, 2}) {
+        unsigned int plane_width = plane > 0 ? (w + 1) >> chroma_shift : w;
+        unsigned int plane_height = plane > 0 ? (h + 1) >> chroma_shift : h;
+        unsigned int plane_bytes_per_row = (plane > 0 ? bytes_per_row >> chroma_shift : bytes_per_row);
+
+        for (int r = 0; r < plane_height; ++r) {
+          size_t bytes_to_read = plane_width * bytespp;
+          if (plane == 0) {
+            if (fread(ptr, 1, bytes_to_read, file) < bytes_to_read) {
+              return false;
+            }
+            ptr += plane_bytes_per_row;
+          } else {
+            if (fseek(file, bytes_to_read, SEEK_CUR) != 0) {
+              return false;
+            }
+          }
+        }
+      }
+      return true;
+    };
+
+    if (!LoadPlanes()) {
+      break;
+    }
+
+    [blitCommandEncoder copyFromBuffer:staging_buffer
+                          sourceOffset:0
+                      sourceBytesPerRow:bytes_per_row
+                    sourceBytesPerImage:bytes_per_row * h
+                            sourceSize:MTLSizeMake(width, height, 1)
+                              toTexture:frame
+                      destinationSlice:0
+                      destinationLevel:0
+                      destinationOrigin:MTLOriginMake(0, 0, 0)];
+    frames.push_back(frame);
+  }
+
+  [blitCommandEncoder endEncoding];
+  [commandBuffer commit];
+
+  fclose(file);
+}
+
+// path/to/app path/to/file.yuv width height
 int main(int argc, char* argv[]) {
   [NSApplication sharedApplication];
   [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
   device = MTLCreateSystemDefaultDevice();
   commandQueue = [device newCommandQueue];
-  for (size_t i = 0; i < 16; ++i) {
-    std::stringstream buffer;
-    buffer << "./scroll/" << std::setfill('0') << std::setw(2) << i << ".png";
-    io_surfaces[i] = LoadImageToIOSurface(buffer.str().c_str(), false);
-    if (!io_surfaces[i]) {
-      if (i > 2) {
-        num_frames = i;
+
+  unsigned int max_frame_count = 16;
+
+  if (argc >= 4 && StrEndsWith(argv[1], ".yuv")) {
+    width = strtoul(argv[2], NULL, 0);
+    height = strtoul(argv[3], NULL, 0);
+    LoadYUVTextures(argv[1], max_frame_count);
+  } else {
+    for (size_t i = 0; i < max_frame_count; ++i) {
+      std::stringstream buffer;
+      buffer << "./scroll/" << std::setfill('0') << std::setw(2) << i << ".png";
+      IOSurfaceRef io_surface = LoadImageToIOSurface(buffer.str().c_str(), false);
+      if (!io_surface) {
         break;
-      } else {
-        CHECK(!"not enough frames :(");
       }
+      frames.push_back(IOSurfaceToTexture(io_surface));
     }
-    textures[i] = IOSurfaceToTexture(io_surfaces[i]);
   }
+  if (frames.size() < 2) {
+    CHECK(!"not enough frames :(");
+  }
+
   motion_vector_texture = CreateMotionVectorTexture(kBlockWidth, kBlockHeight);
 
   NSMenu* menubar = [NSMenu alloc];
@@ -432,6 +531,7 @@ int main(int argc, char* argv[]) {
   [[window contentView] setWantsLayer:YES];
 
   [window setTitle:@"Tiny Metal App"];
+  [window cascadeTopLeftFromPoint:NSMakePoint(100,100)];
   [window makeKeyAndOrderFront:nil];
 
   [NSApp activateIgnoringOtherApps:YES];

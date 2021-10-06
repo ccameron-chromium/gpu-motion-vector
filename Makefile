@@ -21,5 +21,5 @@ app: main.mm
 %.air: %.metal
 	xcrun -sdk macosx metal -O2 -std=osx-metal1.2 -c $< -o $@
 
-shaders.metallib: shaders/shaders.air
-	mkdir -p bin && xcrun -sdk macosx metallib $< -o bin/$@
+shaders.metallib: shaders/shaders.air shaders/me.air
+	mkdir -p bin && xcrun -sdk macosx metallib $^ -o bin/$@

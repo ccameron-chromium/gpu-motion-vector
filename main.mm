@@ -13,6 +13,8 @@ unsigned int width = 1280;
 unsigned int height = 720;
 const int kBlockWidth = 16;
 const int kBlockHeight = 16;
+constexpr unsigned int kPixelSearchRadius = 32;
+constexpr unsigned int kTileSize = 128;
 
 id<MTLDevice> device = nil;
 id<MTLLibrary> library = nil;
@@ -23,6 +25,7 @@ id<MTLRenderPipelineState> renderPipelineState = nil;
 id<MTLRenderPipelineState> reconstructRenderPipelineState = nil;
 id<MTLRenderPipelineState> motionVectorSearchRenderPipelineState = nil;
 id<MTLRenderPipelineState> motionVectorDrawRenderPipelineState = nil;
+id<MTLComputePipelineState> motionVectorSearchComputePipelineState = nil;
 
 size_t frame_index = 0;
 size_t previous_frame_index = 0;
@@ -135,7 +138,7 @@ id<MTLTexture> IOSurfaceToTexture(IOSurfaceRef io_surface) {
 id<MTLTexture> CreateMotionVectorTexture(size_t block_width, size_t block_height) {
   MTLTextureDescriptor* tex_desc = [MTLTextureDescriptor new];
   [tex_desc setTextureType:MTLTextureType2D];
-  [tex_desc setUsage:MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget];
+  [tex_desc setUsage:MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget];
   [tex_desc setPixelFormat:MTLPixelFormatRG16Float];
   [tex_desc setWidth:width / block_width];
   [tex_desc setHeight:height / block_height];
@@ -233,6 +236,65 @@ void LoadShaders() {
       NSLog(@"Failed to create render pipeline state: %@", error);
     CHECK(motionVectorDrawRenderPipelineState);
   }
+
+  {
+    MTLFunctionConstantValues* constantValues = [MTLFunctionConstantValues new];
+    uint32_t blockSize[2] = {kBlockWidth, kBlockHeight};
+    [constantValues setConstantValue:blockSize type:MTLDataTypeUInt2 atIndex:0];
+    [constantValues setConstantValue:&kPixelSearchRadius type:MTLDataTypeUInt atIndex:1];
+
+    NSError* error = nil;
+    id<MTLFunction> computeFunction = [library newFunctionWithName:@"motionVectorSearch"
+                                                    constantValues:constantValues
+                                                             error:&error];
+    if (error)
+      NSLog(@"Failed to create compute pipeline state: %@", error);
+    CHECK(computeFunction);
+
+    motionVectorSearchComputePipelineState =
+      [device newComputePipelineStateWithFunction:computeFunction error:&error];
+    if (error)
+      NSLog(@"Failed to create compute pipeline state: %@", error);
+    CHECK(motionVectorSearchComputePipelineState);
+  }
+}
+
+void ComputeMotionVectors(unsigned int block_width, unsigned int block_height) {
+  unsigned int width_in_blocks = (width + block_width - 1) / block_width;
+  unsigned int height_in_blocks = (height + block_height - 1) / block_height;
+
+  unsigned int blocks_per_tile_x = (kTileSize - 2 * kPixelSearchRadius) / block_width;
+  unsigned int blocks_per_tile_y = (kTileSize - 2 * kPixelSearchRadius) / block_height;
+
+  unsigned int groups_x = (width_in_blocks + blocks_per_tile_x - 1) / blocks_per_tile_x;
+  unsigned int groups_y = (height_in_blocks + blocks_per_tile_y - 1) / blocks_per_tile_y;
+
+  unsigned int threadgroup_memory_for_tile = 2 * // 2 bytes per half float
+    (blocks_per_tile_x * block_width + 2 * kPixelSearchRadius) *
+    (blocks_per_tile_y * block_height + 2 * kPixelSearchRadius);
+
+  id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+  {
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:motionVectorSearchComputePipelineState];
+    [encoder setTexture:frames[frame_index] atIndex:0];
+    [encoder setTexture:frames[previous_frame_index] atIndex:1];
+    [encoder setTexture:motion_vector_texture atIndex:2];
+    [encoder setThreadgroupMemoryLength:threadgroup_memory_for_tile
+                                atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(groups_x, groups_y, 1)
+             threadsPerThreadgroup:MTLSizeMake(
+               blocks_per_tile_x,
+               blocks_per_tile_y,
+               1)
+    ];
+    [encoder endEncoding];
+  }
+  [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+    CFTimeInterval executionDuration = cb.GPUEndTime - cb.GPUStartTime;
+    NSLog(@"Execution time: %f", executionDuration);
+  }];
+  [commandBuffer commit];
 }
 
 void ComputeMotionVectorUsingDraw() {
@@ -273,6 +335,10 @@ void ComputeMotionVectorUsingDraw() {
   }
   [encoder endEncoding];
 
+  [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+    CFTimeInterval executionDuration = cb.GPUEndTime - cb.GPUStartTime;
+    NSLog(@"Execution time: %f", executionDuration);
+  }];
   [commandBuffer commit];
 }
 
@@ -360,7 +426,8 @@ void Draw() {
       printf("Reconstructing frame %lu using frame %lu\n",
           frame_index,
           (frame_index + frames.size() - 1) % frames.size());
-      ComputeMotionVectorUsingDraw();
+      ComputeMotionVectors(kBlockWidth, kBlockHeight);
+      // ComputeMotionVectorUsingDraw();
       Draw();
       break;
     case 'p':

@@ -102,6 +102,42 @@ MotionVectorWithResidual findBestMotionVector(
   return result;
 }
 
+MotionVectorWithResidual findBestMotionVectorExhaustive(
+  thread const half* frame_block_data,
+  threadgroup const half* tile_data,
+  const uint TileWidth,
+  const uint2 block_offset_in_tile) {
+  // Start at the middle.
+  MotionVectorWithResidual result;
+  result.vector = float2(0, 0);
+  result.residual = computeSumOfAbsoluteDifference(
+    frame_block_data, tile_data, TileWidth, block_offset_in_tile);
+
+  if (result.residual == 0.0) {
+    return result;
+  }
+
+  uint2 search_start_offset =
+    block_offset_in_tile - uint2(kPixelSearchRadius, kPixelSearchRadius);
+
+  // TODO: Diamond search on multiple threads?
+  for (uint dy = 0; dy <= 2 * kPixelSearchRadius; ++dy) {
+    for (uint dx = 0; dx <= 2 * kPixelSearchRadius; ++dx) {
+      float sad = computeSumOfAbsoluteDifference(
+        frame_block_data, tile_data, TileWidth, search_start_offset + uint2(dx, dy));
+      if (sad < result.residual) {
+        result.vector = float2(dx, dy) - float2(kPixelSearchRadius, kPixelSearchRadius);
+        result.residual = sad;
+        if (result.residual == 0.0) {
+          return result;
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
 kernel void motionVectorSearch(
   uint2 GlobalID [[ thread_position_in_grid ]],
   uint2 GroupID [[ threadgroup_position_in_grid ]],

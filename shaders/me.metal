@@ -158,10 +158,10 @@ kernel void motionVectorSearch(
   // Load the current frame block into registers.
   for (uint by = 0; by < kBlockSize.y; ++by) {
     for (uint bx = 0; bx < kBlockSize.x; ++bx) {
-      uint2 global_idx = GlobalID * kBlockSize + uint2(bx, by);
-      if (global_idx.x >= frame.get_width() || global_idx.y >= frame.get_height()) {
-        continue;
-      }
+      uint2 global_idx = min(
+        GlobalID * kBlockSize + uint2(bx, by),
+        uint2(frame.get_width() - 1, frame.get_height() - 1)
+      );
       frame_block_data[by * kBlockSize.x + bx] = frame.read(global_idx)[0];
     }
   }
@@ -181,15 +181,13 @@ kernel void motionVectorSearch(
   for (uint ly = 0; ly < lpt.y; ++ly) {
     for (uint lx = 0; lx < lpt.x; ++lx) {
       uint2 offset_in_tile = lpt * LocalID + uint2(lx, ly);
-      int2 global_idx = tile_origin + int2(offset_in_tile);
-      if (global_idx.x < 0 ||
-          global_idx.y < 0 ||
-          uint(global_idx.x) >= previous.get_width() ||
-          uint(global_idx.y) >= previous.get_height()) {
-        continue;
-      }
+      uint2 global_idx = uint2(clamp(
+        tile_origin + int2(offset_in_tile),
+        int2(0, 0),
+        int2(previous.get_width() - 1, previous.get_height() - 1)
+      ));
       tile_data[offset_in_tile.y * TileSize.x + offset_in_tile.x] =
-        previous.read(uint2(global_idx))[0];
+        previous.read(global_idx)[0];
     }
   }
 

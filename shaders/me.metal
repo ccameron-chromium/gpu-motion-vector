@@ -31,37 +31,76 @@ MotionVectorWithResidual findBestMotionVector(
   threadgroup const half* tile_data,
   const uint TileWidth,
   const uint2 block_offset_in_tile) {
-  // Start at the middle.
-  MotionVectorWithResidual result;
-  result.vector = float2(0, 0);
-  result.residual = computeSumOfAbsoluteDifference(
-    frame_block_data, tile_data, TileWidth, block_offset_in_tile);
 
-  if (result.residual == 0.0) {
-    return result;
+  int2 lds_offsets[9] = {
+    int2(0,0),
+    int2(-2,0), int2(2,0),
+    int2(0,-2), int2(0,2),
+    int2(-1,-1), int2(-1,1),
+    int2(1,-1), int2(1,1),
+  };
+
+  uint2 cur_offset = block_offset_in_tile;
+  uint min_index = 0;
+  float residual = computeSumOfAbsoluteDifference(
+    frame_block_data, tile_data, TileWidth,
+    cur_offset);
+
+  // Large Diamond Search
+  while (true) {
+    uint2 next_offset;
+    for (uint i = 1; i < 9; ++i) {
+      int2 offset = int2(cur_offset) + lds_offsets[i];
+      if (any(abs(offset - int2(cur_offset)) > int2(kPixelSearchRadius, kPixelSearchRadius))) {
+        continue;
+      }
+
+      float sad = computeSumOfAbsoluteDifference(
+        frame_block_data, tile_data, TileWidth,
+        uint2(offset));
+      if (sad < residual) {
+        residual = sad;
+        min_index = i;
+        next_offset = uint2(offset);
+      }
+    }
+
+    if (min_index == 0) {
+      break;
+    }
+
+    cur_offset = next_offset;
+    min_index = 0;
   }
 
-  uint2 search_start_offset =
-    block_offset_in_tile - uint2(kPixelSearchRadius, kPixelSearchRadius);
+  // Small Diamond Search
+  int2 sds_offsets[4] = {
+    int2(-1,0), int2(1,0),
+    int2(0,-1), int2(0,1)
+  };
 
-  // TODO: Diamond search on multiple threads?
-  for (uint dy = 0; dy <= 2 * kPixelSearchRadius; ++dy) {
-    for (uint dx = 0; dx <= 2 * kPixelSearchRadius; ++dx) {
-      float sad = computeSumOfAbsoluteDifference(
-        frame_block_data, tile_data, TileWidth, search_start_offset + uint2(dx, dy));
-      if (sad < result.residual) {
-        result.vector = float2(dx, dy) - float2(kPixelSearchRadius, kPixelSearchRadius);
-        result.residual = sad;
-        if (result.residual == 0.0) {
-          return result;
-        }
-      }
+  uint2 next_offset = cur_offset;
+  for (uint i = 0; i < 4; ++i) {
+    int2 offset = int2(cur_offset) + sds_offsets[i];
+    if (any(abs(offset - int2(cur_offset)) > int2(kPixelSearchRadius, kPixelSearchRadius))) {
+      continue;
+    }
+
+    float sad = computeSumOfAbsoluteDifference(
+      frame_block_data, tile_data, TileWidth,
+      uint2(offset));
+    if (sad < residual) {
+      residual = sad;
+      next_offset = uint2(offset);
     }
   }
 
+  MotionVectorWithResidual result;
+  result.vector = float2(next_offset) - float2(block_offset_in_tile);
+  result.residual = residual;
+
   return result;
 }
-
 
 kernel void motionVectorSearch(
   uint2 GlobalID [[ thread_position_in_grid ]],

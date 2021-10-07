@@ -269,9 +269,12 @@ void ComputeMotionVectors(unsigned int block_width, unsigned int block_height) {
   unsigned int groups_x = (width_in_blocks + blocks_per_tile_x - 1) / blocks_per_tile_x;
   unsigned int groups_y = (height_in_blocks + blocks_per_tile_y - 1) / blocks_per_tile_y;
 
+  // Can be at most 32K on Mac and 16K on iOS
+  // Algorithm would need to be adapted for mobile platforms to use less memory.
   unsigned int threadgroup_memory_for_tile = 2 * // 2 bytes per half float
     (blocks_per_tile_x * block_width + 2 * kPixelSearchRadius) *
     (blocks_per_tile_y * block_height + 2 * kPixelSearchRadius);
+  CHECK(threadgroup_memory_for_tile <= 32768);
 
   id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
   {

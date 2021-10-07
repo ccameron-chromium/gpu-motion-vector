@@ -26,118 +26,6 @@ typedef struct {
     float residual;
 } MotionVectorWithResidual;
 
-MotionVectorWithResidual findBestMotionVector(
-  thread const half* frame_block_data,
-  threadgroup const half* tile_data,
-  const uint TileWidth,
-  const uint2 block_offset_in_tile) {
-
-  int2 lds_offsets[9] = {
-    int2(0,0),
-    int2(-2,0), int2(2,0),
-    int2(0,-2), int2(0,2),
-    int2(-1,-1), int2(-1,1),
-    int2(1,-1), int2(1,1),
-  };
-
-  uint2 cur_offset = block_offset_in_tile;
-  uint min_index = 0;
-  float residual = computeSumOfAbsoluteDifference(
-    frame_block_data, tile_data, TileWidth,
-    cur_offset);
-
-  // Large Diamond Search
-  while (true) {
-    uint2 next_offset;
-    for (uint i = 1; i < 9; ++i) {
-      int2 offset = int2(cur_offset) + lds_offsets[i];
-      if (any(abs(offset - int2(cur_offset)) > int2(kPixelSearchRadius, kPixelSearchRadius))) {
-        continue;
-      }
-
-      float sad = computeSumOfAbsoluteDifference(
-        frame_block_data, tile_data, TileWidth,
-        uint2(offset));
-      if (sad < residual) {
-        residual = sad;
-        min_index = i;
-        next_offset = uint2(offset);
-      }
-    }
-
-    if (min_index == 0) {
-      break;
-    }
-
-    cur_offset = next_offset;
-    min_index = 0;
-  }
-
-  // Small Diamond Search
-  int2 sds_offsets[4] = {
-    int2(-1,0), int2(1,0),
-    int2(0,-1), int2(0,1)
-  };
-
-  uint2 next_offset = cur_offset;
-  for (uint i = 0; i < 4; ++i) {
-    int2 offset = int2(cur_offset) + sds_offsets[i];
-    if (any(abs(offset - int2(cur_offset)) > int2(kPixelSearchRadius, kPixelSearchRadius))) {
-      continue;
-    }
-
-    float sad = computeSumOfAbsoluteDifference(
-      frame_block_data, tile_data, TileWidth,
-      uint2(offset));
-    if (sad < residual) {
-      residual = sad;
-      next_offset = uint2(offset);
-    }
-  }
-
-  MotionVectorWithResidual result;
-  result.vector = float2(next_offset) - float2(block_offset_in_tile);
-  result.residual = residual;
-
-  return result;
-}
-
-MotionVectorWithResidual findBestMotionVectorExhaustive(
-  thread const half* frame_block_data,
-  threadgroup const half* tile_data,
-  const uint TileWidth,
-  const uint2 block_offset_in_tile) {
-  // Start at the middle.
-  MotionVectorWithResidual result;
-  result.vector = float2(0, 0);
-  result.residual = computeSumOfAbsoluteDifference(
-    frame_block_data, tile_data, TileWidth, block_offset_in_tile);
-
-  if (result.residual == 0.0) {
-    return result;
-  }
-
-  uint2 search_start_offset =
-    block_offset_in_tile - uint2(kPixelSearchRadius, kPixelSearchRadius);
-
-  // TODO: Diamond search on multiple threads?
-  for (uint dy = 0; dy <= 2 * kPixelSearchRadius; ++dy) {
-    for (uint dx = 0; dx <= 2 * kPixelSearchRadius; ++dx) {
-      float sad = computeSumOfAbsoluteDifference(
-        frame_block_data, tile_data, TileWidth, search_start_offset + uint2(dx, dy));
-      if (sad < result.residual) {
-        result.vector = float2(dx, dy) - float2(kPixelSearchRadius, kPixelSearchRadius);
-        result.residual = sad;
-        if (result.residual == 0.0) {
-          return result;
-        }
-      }
-    }
-  }
-
-  return result;
-}
-
 kernel void motionVectorSearch(
   uint2 GlobalID [[ thread_position_in_grid ]],
   uint2 GroupID [[ threadgroup_position_in_grid ]],
@@ -146,60 +34,125 @@ kernel void motionVectorSearch(
   texture2d<half, access::read> frame[[texture(0)]],
   texture2d<half, access::read> previous[[texture(1)]],
   texture2d<half, access::write> mv_texture[[texture(2)]],
-  threadgroup half* tile_data [[threadgroup(0)]]
+  threadgroup half* tile_data[[threadgroup(0)]]
 ) {
-  // Alias some names to make it easier to understand code in context.
-  const uint2 BlockIDInGroup = LocalID;
-  const uint2 BlocksPerGroup = ThreadsPerGroup;
-  const uint2 TileSize = BlocksPerGroup * kBlockSize + 2 * kPixelSearchRadius;
+  const uint2 BlockID = GroupID;
+  const uint LocalIndex = LocalID.y * ThreadsPerGroup.x + LocalID.x;
+  const uint LocalThreadCount = ThreadsPerGroup.x * ThreadsPerGroup.y;
 
   half frame_block_data[kMaxBlockSize * kMaxBlockSize];
+
+  uint2 block_origin = BlockID * kBlockSize;
+
+  const uint2 TileSize = kBlockSize + 2 * kPixelSearchRadius;
+  const int2 tile_origin = int2(block_origin) - kPixelSearchRadius;
+  const uint2 block_offset_in_tile = uint2(kPixelSearchRadius, kPixelSearchRadius);
+
+  // Cooperative load into |tile_data|
+  for (uint flat_idx = LocalIndex;
+            flat_idx < TileSize.x * TileSize.y;
+            flat_idx += LocalThreadCount) {
+    uint y = flat_idx / TileSize.x;
+    uint x = flat_idx - y * TileSize.x;
+    int2 global_idx = tile_origin + int2(x, y);
+    tile_data[flat_idx] = previous.read(uint2(clamp(
+        global_idx,
+        int2(0,0),
+        int2(previous.get_width(), previous.get_height()))))[0];
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Load the current frame block into registers.
   for (uint by = 0; by < kBlockSize.y; ++by) {
     for (uint bx = 0; bx < kBlockSize.x; ++bx) {
       uint2 global_idx = min(
-        GlobalID * kBlockSize + uint2(bx, by),
+        block_origin + uint2(bx, by),
         uint2(frame.get_width() - 1, frame.get_height() - 1)
       );
       frame_block_data[by * kBlockSize.x + bx] = frame.read(global_idx)[0];
     }
   }
 
-  // top left corner, in pixels, of the first block in the group
-  uint2 first_block_origin = GroupID * BlocksPerGroup * kBlockSize;
+  constexpr uint kLDSCount = 1 + 8;
+  constexpr int2 lds_offsets[kLDSCount] = {
+    int2(0,0),
 
-  // Load pixels |kSearchRadius| away from the top left corner of a block,
-  // offset by half the block size.
-  int2 tile_origin_offset = -int2(kPixelSearchRadius);
+    // abs(x) + abs(y) == 2
+    int2(-2,0), int2(2,0),
+    int2(0,-2), int2(0,2),
+    int2(-1,-1), int2(-1,1),
+    int2(1,-1), int2(1,1),
+  };
 
-  int2 tile_origin = int2(first_block_origin) + tile_origin_offset;
+  int2 cur_offset = int2(0, 0);
 
-  // lpt: loads per thread
-  uint2 lpt = (TileSize + ThreadsPerGroup - 1) / ThreadsPerGroup;
-  // Load a (TileSize x TileSize) region from |previous| into |tile_data|
-  for (uint ly = 0; ly < lpt.y; ++ly) {
-    for (uint lx = 0; lx < lpt.x; ++lx) {
-      uint2 offset_in_tile = lpt * LocalID + uint2(lx, ly);
-      uint2 global_idx = uint2(clamp(
-        tile_origin + int2(offset_in_tile),
-        int2(0, 0),
-        int2(previous.get_width() - 1, previous.get_height() - 1)
-      ));
-      tile_data[offset_in_tile.y * TileSize.x + offset_in_tile.x] =
-        previous.read(global_idx)[0];
+  float best_residual;
+  threadgroup float residuals[kLDSCount];
+
+  while (true && LocalIndex < kLDSCount) {
+    int2 offset = cur_offset + lds_offsets[LocalIndex];
+    if (any(abs(offset) > int2(kPixelSearchRadius, kPixelSearchRadius))) {
+      residuals[LocalIndex] = INFINITY;
+    } else {
+      residuals[LocalIndex] = computeSumOfAbsoluteDifference(
+        frame_block_data, tile_data, TileSize.x,
+        uint2(int2(block_offset_in_tile) + offset));
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    best_residual = residuals[0];
+    uint best_i = 0;
+    int2 next_offset = cur_offset;
+    for (uint i = 1; i < kLDSCount; ++i) {
+      float r = residuals[i];
+      if (r < best_residual) {
+        best_residual = r;
+        best_i = i;
+        next_offset = cur_offset + lds_offsets[i];
+      }
+    }
+
+    if (best_i == 0) {
+      break;
+    }
+
+    cur_offset = next_offset;
+  }
+
+  // Small Diamond Search
+  constexpr uint kSDSCount = 4;
+  constexpr int2 sds_offsets[kSDSCount] = {
+    // abs(x) + abs(y) == 1
+    int2(-1,0), int2(1,0),
+    int2(0,-1), int2(0,1)
+  };
+
+  if (LocalIndex < kSDSCount) {
+    int2 offset = cur_offset + sds_offsets[LocalIndex];
+    if (any(abs(offset) > int2(kPixelSearchRadius, kPixelSearchRadius))) {
+      residuals[LocalIndex] = INFINITY;
+    } else {
+      residuals[LocalIndex] = computeSumOfAbsoluteDifference(
+        frame_block_data, tile_data, TileSize.x,
+        uint2(int2(block_offset_in_tile) + offset));
     }
   }
 
-  // Wait for all threads to load from main memory into tile_data
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  uint2 block_origin = first_block_origin + BlockIDInGroup * kBlockSize;
-  uint2 block_offset_in_tile = uint2(int2(block_origin) - tile_origin);
+  if (LocalIndex == 0) {
+    int2 best_offset = cur_offset;
+    for (uint i = 0; i < kSDSCount; ++i) {
+      float r = residuals[i];
+      if (r < best_residual) {
+        best_residual = r;
+        best_offset = cur_offset + sds_offsets[i];
+      }
+    }
 
-  MotionVectorWithResidual mv = findBestMotionVector(
-    frame_block_data, tile_data, TileSize.x, block_offset_in_tile);
-
-  mv_texture.write(half4(mv.vector.x, mv.vector.y, 0.0, 1.0),
-                   GroupID * BlocksPerGroup + BlockIDInGroup);
+    mv_texture.write(half4(float(best_offset.x), float(best_offset.y), 0.0, 1.0),
+                  BlockID);
+  }
 };

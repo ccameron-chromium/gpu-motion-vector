@@ -263,18 +263,8 @@ void ComputeMotionVectors(unsigned int block_width, unsigned int block_height) {
   unsigned int width_in_blocks = (width + block_width - 1) / block_width;
   unsigned int height_in_blocks = (height + block_height - 1) / block_height;
 
-  unsigned int blocks_per_tile_x = (kTileSize - 2 * kPixelSearchRadius) / block_width;
-  unsigned int blocks_per_tile_y = (kTileSize - 2 * kPixelSearchRadius) / block_height;
-
-  unsigned int groups_x = (width_in_blocks + blocks_per_tile_x - 1) / blocks_per_tile_x;
-  unsigned int groups_y = (height_in_blocks + blocks_per_tile_y - 1) / blocks_per_tile_y;
-
-  // Can be at most 32K on Mac and 16K on iOS
-  // Algorithm would need to be adapted for mobile platforms to use less memory.
-  unsigned int threadgroup_memory_for_tile = 2 * // 2 bytes per half float
-    (blocks_per_tile_x * block_width + 2 * kPixelSearchRadius) *
-    (blocks_per_tile_y * block_height + 2 * kPixelSearchRadius);
-  CHECK(threadgroup_memory_for_tile <= 32768);
+  unsigned int threadgroup_memory_for_tile =
+    2 * (block_width + 2 * kPixelSearchRadius) * (block_height + 2 * kPixelSearchRadius);
 
   id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
   {
@@ -285,11 +275,9 @@ void ComputeMotionVectors(unsigned int block_width, unsigned int block_height) {
     [encoder setTexture:motion_vector_texture atIndex:2];
     [encoder setThreadgroupMemoryLength:threadgroup_memory_for_tile
                                 atIndex:0];
-    [encoder dispatchThreadgroups:MTLSizeMake(groups_x, groups_y, 1)
+    [encoder dispatchThreadgroups:MTLSizeMake(width_in_blocks, height_in_blocks, 1)
              threadsPerThreadgroup:MTLSizeMake(
-               blocks_per_tile_x,
-               blocks_per_tile_y,
-               1)
+               8, 8, 1)
     ];
     [encoder endEncoding];
   }

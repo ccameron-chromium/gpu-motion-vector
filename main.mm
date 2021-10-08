@@ -23,6 +23,7 @@ CAMetalLayer* metalLayer = nil;
 
 id<MTLRenderPipelineState> renderPipelineState = nil;
 id<MTLRenderPipelineState> reconstructRenderPipelineState = nil;
+id<MTLRenderPipelineState> diffRenderPipelineState = nil;
 id<MTLRenderPipelineState> motionVectorSearchRenderPipelineState = nil;
 id<MTLRenderPipelineState> motionVectorDrawRenderPipelineState = nil;
 id<MTLComputePipelineState> motionVectorSearchComputePipelineState = nil;
@@ -34,6 +35,7 @@ enum DisplayMode {
   DMPreviousFrame,
   DMCurrentFrame,
   DMReconstructedFrame,
+  DMDiffFrame,
 };
 DisplayMode display_mode = DMCurrentFrame;
 bool display_motion_vectors = false;
@@ -186,7 +188,7 @@ void LoadShaders() {
   }
 
   {
-    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"reconstructVertexShader"];
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"projectVertexShader"];
     id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"reconstructFragmentShader"];
 
     NSError* error = nil;
@@ -202,10 +204,34 @@ void LoadShaders() {
   }
 
   {
-    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"motionVectorSearchVertexShader"];
-    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"motionVectorSearchFragmentShader"];
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"projectVertexShader"];
+    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"diffFragmentShader"];
 
     NSError* error = nil;
+    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.label = @"Simple Pipeline";
+    desc.vertexFunction = vertexFunction;
+    desc.fragmentFunction = fragmentFunction;
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    diffRenderPipelineState = [device newRenderPipelineStateWithDescriptor:desc
+                                                                 error:&error];
+    if (error)
+      NSLog(@"Failed to create render pipeline state: %@", error);
+  }
+
+  {
+    MTLFunctionConstantValues* constantValues = [MTLFunctionConstantValues new];
+    uint32_t blockSize[2] = {kBlockWidth, kBlockHeight};
+    [constantValues setConstantValue:blockSize type:MTLDataTypeUInt2 atIndex:0];
+
+    NSError* error = nil;
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"motionVectorSearchVertexShader"];
+    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"motionVectorSearchFragmentShader"
+                                                     constantValues:constantValues
+                                                              error:&error];
+    if (error)
+      NSLog(@"Failed to create render pipeline state: %@", error);
+
     MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.label = @"Simple Pipeline";
     desc.vertexFunction = vertexFunction;
@@ -318,6 +344,10 @@ void ComputeMotionVectorUsingDraw() {
     [encoder setVertexBytes:positions
                      length:sizeof(positions)
                     atIndex:0];
+    uint32_t size[2] = {width, height};
+    [encoder setVertexBytes:size
+                     length:sizeof(size)
+                    atIndex:1];
     [encoder setFragmentTexture:frames[frame_index] atIndex:0];
     [encoder setFragmentTexture:frames[previous_frame_index] atIndex:1];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle
@@ -367,9 +397,27 @@ void Draw() {
         [encoder setFragmentTexture:frames[previous_frame_index] atIndex:0];
         break;
       case DMReconstructedFrame:
+        {
+          uint32_t size[2] = {width, height};
+          [encoder setFragmentBytes:size
+                          length:sizeof(size)
+                          atIndex:0];
+        }
         [encoder setRenderPipelineState:reconstructRenderPipelineState];
         [encoder setFragmentTexture:frames[previous_frame_index] atIndex:0];
         [encoder setFragmentTexture:motion_vector_texture atIndex:1];
+        break;
+      case DMDiffFrame:
+        {
+          uint32_t size[2] = {width, height};
+          [encoder setFragmentBytes:size
+                          length:sizeof(size)
+                          atIndex:0];
+        }
+        [encoder setRenderPipelineState:diffRenderPipelineState];
+        [encoder setFragmentTexture:frames[previous_frame_index] atIndex:0];
+        [encoder setFragmentTexture:frames[frame_index] atIndex:1];
+        [encoder setFragmentTexture:motion_vector_texture atIndex:2];
         break;
     }
     vector_float2 positions[6] = {
@@ -387,6 +435,16 @@ void Draw() {
   if (display_motion_vectors) {
     [encoder setRenderPipelineState:motionVectorDrawRenderPipelineState];
     [encoder setVertexTexture:motion_vector_texture atIndex:0];
+
+    uint32_t size[2] = {width, height};
+    [encoder setVertexBytes:size
+                     length:sizeof(size)
+                    atIndex:0];
+
+    uint32_t block_size[2] = {kBlockWidth, kBlockHeight};
+    [encoder setVertexBytes:block_size
+                     length:sizeof(block_size)
+                    atIndex:1];
     [encoder drawPrimitives:MTLPrimitiveTypeLine
                 vertexStart:0
                 vertexCount:2 * (width / kBlockWidth) * (height / kBlockHeight)];
@@ -435,6 +493,10 @@ void Draw() {
       break;
     case 'r':
       display_mode = DMReconstructedFrame;
+      Draw();
+      break;
+    case 'd':
+      display_mode = DMDiffFrame;
       Draw();
       break;
     case 'q':
@@ -553,7 +615,7 @@ int main(int argc, char* argv[]) {
   } else {
     for (size_t i = 0; i < max_frame_count; ++i) {
       std::stringstream buffer;
-      buffer << "./scroll/" << std::setfill('0') << std::setw(2) << i << ".png";
+      buffer << "./complex/" << std::setfill('0') << std::setw(2) << i << ".png";
       IOSurfaceRef io_surface = LoadImageToIOSurface(buffer.str().c_str(), false);
       if (!io_surface) {
         break;

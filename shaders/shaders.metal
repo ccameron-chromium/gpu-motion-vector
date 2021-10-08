@@ -2,8 +2,7 @@
 #include <simd/simd.h>
 using namespace metal;
 
-constant uint kBlockWidth = 16;
-constant uint kBlockHeight = 16;
+constant uint2 kBlockSize [[function_constant(0)]];
 
 typedef struct {
     float4 clipSpacePosition [[position]];
@@ -42,8 +41,8 @@ float computeSumOfAbsoluteDifference(texture2d<float> a,
                       address::clamp_to_edge,
                       filter::linear);
   float total = 0.0;
-  for (uint x = 0; x < kBlockWidth; ++x) {
-    for (uint y = 0; y < kBlockHeight; ++y) {
+  for (uint x = 0; x < kBlockSize.x; ++x) {
+    for (uint y = 0; y < kBlockSize.y; ++y) {
       float2 delta = float2(x, y);
       float a_sample = a.sample(s, a_texcoord + delta).r;
       float b_sample = b.sample(s, b_texcoord + delta).r;
@@ -94,12 +93,13 @@ typedef struct {
 
 vertex MotionVectorSearchRasterizerData motionVectorSearchVertexShader(
     uint vertexID [[vertex_id]],
-    constant vector_float2 *positions[[buffer(0)]]) {
+    constant vector_float2 *positions[[buffer(0)]],
+    constant vector_uint2 *size[[buffer(1)]]) {
   MotionVectorSearchRasterizerData out;
   out.clipSpacePosition = vector_float4(0.0, 0.0, 0.0, 1.0);
   out.clipSpacePosition.xy = positions[vertexID].xy;
-  out.texcoord.x = 1280 * (0.5 + 0.5 * positions[vertexID].x);
-  out.texcoord.y =  720 * (0.5 + 0.5 * positions[vertexID].y);
+  out.texcoord.x = (*size).x * (0.5 + 0.5 * positions[vertexID].x);
+  out.texcoord.y = (*size).y * (0.5 + 0.5 * positions[vertexID].y);
   return out;
 }
 
@@ -123,12 +123,14 @@ typedef struct {
 
 vertex MotionVectorDrawRasterizerData motionVectorDrawVertexShader(
     uint vertexID [[vertex_id]],
-    texture2d<float> motionVectors[[texture(0)]]) {
-  uint width = 1280 / kBlockWidth;
-  uint height = 720 / kBlockHeight;
+    texture2d<float> motionVectors[[texture(0)]],
+    constant vector_uint2 *size[[buffer(0)]],
+    constant vector_uint2 *block_size[[buffer(1)]]) {
+
+  uint2 size_in_blocks = *size / *block_size;
 
   uint p = vertexID % 2;
-  uint2 xy = uint2((vertexID / 2) % width, (vertexID / 2) / width);
+  uint2 xy = uint2((vertexID / 2) % size_in_blocks.x, (vertexID / 2) / size_in_blocks.x);
   float2 xyf = float2(xy.x + 0.5, xy.y + 0.5);
 
   MotionVectorDrawRasterizerData out;
@@ -139,15 +141,15 @@ vertex MotionVectorDrawRasterizerData motionVectorDrawVertexShader(
                         filter::linear);
 
     float2 mv = motionVectors.sample(s, xyf).xy;
-    out.clipSpacePosition.x -= mv.x / kBlockWidth;
-    out.clipSpacePosition.y -= mv.y / kBlockHeight;
+    out.clipSpacePosition.x -= mv.x / (*block_size).x;
+    out.clipSpacePosition.y -= mv.y / (*block_size).y;
   }
   out.endpoint = p;
 
 
   out.clipSpacePosition.xy *= 2;
-  out.clipSpacePosition.x /= width;
-  out.clipSpacePosition.y /= height;
+  out.clipSpacePosition.x /= size_in_blocks.x;
+  out.clipSpacePosition.y /= size_in_blocks.y;
   out.clipSpacePosition.xy -= float2(1.0, 1.0);
   out.clipSpacePosition.z = 0.0;
   out.clipSpacePosition.w = 1.0;
@@ -168,7 +170,7 @@ typedef struct {
     float2 mvTexcoord;
 } ReconstructRasterizerData;
 
-vertex ReconstructRasterizerData reconstructVertexShader(
+vertex ReconstructRasterizerData projectVertexShader(
     uint vertexID [[vertex_id]],
     constant vector_float2 *positions[[buffer(0)]]) {
   ReconstructRasterizerData out;
@@ -183,17 +185,36 @@ vertex ReconstructRasterizerData reconstructVertexShader(
 
 fragment float4 reconstructFragmentShader(ReconstructRasterizerData in [[stage_in]],
                                texture2d<float> previous[[texture(0)]],
-                               texture2d<float> motionVectors[[texture(1)]]) {
+                               texture2d<float> motionVectors[[texture(1)]],
+                               constant vector_uint2 *size[[buffer(0)]]) {
   constexpr sampler s(coord::normalized,
                       address::clamp_to_edge,
                       filter::nearest);
 
   float2 mv = motionVectors.sample(s, in.mvTexcoord).rg;
-  mv.x /= 1280.0;
-  mv.y /=  720.0;
+  mv.x /= float((*size).x);
+  mv.y /= float((*size).y);
 
   float4 color = previous.sample(s, in.texcoord + mv);
   color.a = 1.0;
   return color;
 }
 
+fragment float4 diffFragmentShader(ReconstructRasterizerData in [[stage_in]],
+                               texture2d<float> previous[[texture(0)]],
+                               texture2d<float> frame[[texture(1)]],
+                               texture2d<float> motionVectors[[texture(2)]],
+                               constant vector_uint2 *size[[buffer(0)]]) {
+  constexpr sampler s(coord::normalized,
+                      address::clamp_to_edge,
+                      filter::nearest);
+
+  float2 mv = motionVectors.sample(s, in.mvTexcoord).rg;
+  mv.x /= float((*size).x);
+  mv.y /= float((*size).y);
+
+  float predicted = previous.sample(s, in.texcoord + mv)[0];
+  float expected = frame.sample(s, in.texcoord + mv)[0];
+  float diff = abs(predicted - expected);
+  return float4(diff, diff, diff, 1.0);
+}

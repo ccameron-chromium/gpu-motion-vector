@@ -24,7 +24,6 @@ CAMetalLayer* metalLayer = nil;
 id<MTLRenderPipelineState> renderPipelineState = nil;
 id<MTLRenderPipelineState> reconstructRenderPipelineState = nil;
 id<MTLRenderPipelineState> diffRenderPipelineState = nil;
-id<MTLRenderPipelineState> motionVectorSearchRenderPipelineState = nil;
 id<MTLRenderPipelineState> motionVectorDrawRenderPipelineState = nil;
 id<MTLComputePipelineState> motionVectorSearchComputePipelineState = nil;
 
@@ -41,6 +40,7 @@ DisplayMode display_mode = DMCurrentFrame;
 bool display_motion_vectors = false;
 
 std::vector<id<MTLTexture>> frames;
+std::vector<IOSurfaceRef> io_surfaces;
 
 id<MTLTexture> motion_vector_texture;
 
@@ -81,8 +81,86 @@ IOSurfaceRef LoadImageToIOSurface(const char* filename, bool use_nv12) {
   CHECK(image_data_size == 4 * image_width * image_height);
 
   IOSurfaceRef io_surface = nullptr;
-  if (use_nv12) {
-    CHECK(!"This isn't implemented");
+  if (false && use_nv12) {
+    uint32_t io_format = '420v';
+
+    const size_t y_width = image_width;
+    const size_t y_height = image_height;
+    const size_t y_bytes_per_pixel = 1;
+    const size_t y_bytes_per_row = IOSurfaceAlignProperty(
+        kIOSurfaceBytesPerRow, y_width * y_bytes_per_pixel);
+    const size_t y_bytes_total = IOSurfaceAlignProperty(
+        kIOSurfacePlaneSize, y_height * y_bytes_per_row);
+    const size_t y_offset =
+        IOSurfaceAlignProperty(kIOSurfacePlaneOffset, 0);
+
+    const size_t uv_width = (image_width + 1) / 2;
+    const size_t uv_height = (image_height + 1) / 2;
+    const size_t uv_bytes_per_pixel = 2;
+    const size_t uv_bytes_per_row = IOSurfaceAlignProperty(
+        kIOSurfaceBytesPerRow, uv_width * uv_bytes_per_pixel);
+    const size_t uv_bytes_total = IOSurfaceAlignProperty(
+        kIOSurfaceAllocSize, uv_height * uv_bytes_per_row);
+    const size_t uv_offset =
+        IOSurfaceAlignProperty(kIOSurfacePlaneOffset, y_offset + y_bytes_total);
+
+    NSDictionary *y_options = @{
+        (id)kIOSurfacePlaneWidth: @(y_width),
+        (id)kIOSurfacePlaneHeight: @(y_height),
+        (id)kIOSurfacePlaneBytesPerElement: @(y_bytes_per_pixel),
+        (id)kIOSurfacePlaneBytesPerRow: @(y_bytes_per_row),
+        (id)kIOSurfacePlaneSize: @(y_bytes_total),
+        (id)kIOSurfacePlaneOffset: @(y_offset),
+    };
+
+    NSDictionary *uv_options = @{
+        (id)kIOSurfacePlaneWidth: @(uv_width),
+        (id)kIOSurfacePlaneHeight: @(uv_height),
+        (id)kIOSurfacePlaneBytesPerElement: @(uv_bytes_per_pixel),
+        (id)kIOSurfacePlaneBytesPerRow: @(uv_bytes_per_row),
+        (id)kIOSurfacePlaneSize: @(uv_bytes_total),
+        (id)kIOSurfacePlaneOffset: @(uv_offset),
+    };
+
+    NSArray* plane_info = @[ y_options, uv_options ];
+
+    const size_t bytes_total = IOSurfaceAlignProperty(
+        kIOSurfaceAllocSize, uv_offset + uv_bytes_total);
+    NSDictionary *options = @{
+        (id)kIOSurfaceWidth: @(image_width),
+        (id)kIOSurfaceHeight: @(image_height),
+        (id)kIOSurfacePixelFormat: @(io_format),
+        (id)kIOSurfaceAllocSize: @(bytes_total),
+        (id)kIOSurfacePlaneInfo: plane_info,
+    };
+    io_surface = IOSurfaceCreate(
+        (__bridge CFDictionaryRef)options);
+    CHECK(io_surface);
+
+
+    IOSurfaceLock(io_surface, kIOSurfaceLockAvoidSync, nullptr);
+    uint8_t* y_ptr = (uint8_t*)IOSurfaceGetBaseAddressOfPlane(
+        io_surface, 0);
+    uint8_t* uv_ptr = (uint8_t*)IOSurfaceGetBaseAddressOfPlane(
+        io_surface, 1);
+    for (int row = 0; row < image_height; ++row) {
+      for (int col = 0; col < image_width; ++col) {
+        const uint8_t* src = image_data_ptr + 4 * (col + row * image_width);
+        uint8_t* y_dst = y_ptr + y_bytes_per_pixel * col +
+                                 y_bytes_per_row * row;
+        uint8_t* uv_dst = uv_ptr + uv_bytes_per_pixel * col / 2 +
+                                   uv_bytes_per_row * row / 2;
+        float r = src[0] / 255.;
+        float g = src[1] / 255.;
+        float b = src[2] / 255.;
+        y_dst[0]  = (0.0625f + 0.257*r + 0.504*g + 0.098f*b) * 255;
+        if (row % 2 == 0 && col % 2 == 0) {
+          uv_dst[0] = (0.5000f - 0.148*r - 0.291*g + 0.439f*b) * 255;
+          uv_dst[1] = (0.5000f + 0.439*r - 0.368*g - 0.071f*b) * 255;
+        }
+      }
+    }
+    IOSurfaceUnlock(io_surface, kIOSurfaceLockAvoidSync, nullptr);
   } else {
     uint32_t io_format = 'BGRA';
     const size_t bytes_per_pixel = 4;
@@ -106,9 +184,15 @@ IOSurfaceRef LoadImageToIOSurface(const char* filename, bool use_nv12) {
     uint8_t* io_surface_data_ptr = (uint8_t*)IOSurfaceGetBaseAddressOfPlane(
         io_surface, 0);
     for (int row = 0; row < image_height; ++row) {
-      const void* src = image_data_ptr + row * 4 * image_width;
-      void* dst = io_surface_data_ptr + row * bytes_per_row;
-      memcpy(dst, src, 4 * image_width);
+      for (int col = 0; col < image_width; ++col) {
+        const uint8_t* src = image_data_ptr + 4 * (col + row * image_width);
+        uint8_t* dst = io_surface_data_ptr + bytes_per_pixel * col +
+                                             bytes_per_row * row;
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = src[3];
+      }
     }
     IOSurfaceUnlock(io_surface, kIOSurfaceLockAvoidSync, nullptr);
   }
@@ -122,7 +206,17 @@ id<MTLTexture> IOSurfaceToTexture(IOSurfaceRef io_surface) {
   MTLTextureDescriptor* tex_desc = [MTLTextureDescriptor new];
   [tex_desc setTextureType:MTLTextureType2D];
   [tex_desc setUsage:MTLTextureUsageShaderRead];
-  [tex_desc setPixelFormat:MTLPixelFormatRGBA8Unorm];
+  switch (IOSurfaceGetPixelFormat(io_surface)) {
+    case 'BGRA':
+      [tex_desc setPixelFormat:MTLPixelFormatBGRA8Unorm];
+      break;
+    case '420v':
+      [tex_desc setPixelFormat:MTLPixelFormatR8Unorm];
+      break;
+    default:
+      CHECK(!"unexpected IOSurface foramt");
+      break;
+  }
   [tex_desc setWidth:IOSurfaceGetWidthOfPlane(io_surface, 0)];
   [tex_desc setHeight:IOSurfaceGetHeightOfPlane(io_surface, 0)];
   [tex_desc setDepth:1];
@@ -220,31 +314,6 @@ void LoadShaders() {
   }
 
   {
-    MTLFunctionConstantValues* constantValues = [MTLFunctionConstantValues new];
-    uint32_t blockSize[2] = {kBlockWidth, kBlockHeight};
-    [constantValues setConstantValue:blockSize type:MTLDataTypeUInt2 atIndex:0];
-
-    NSError* error = nil;
-    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"motionVectorSearchVertexShader"];
-    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"motionVectorSearchFragmentShader"
-                                                     constantValues:constantValues
-                                                              error:&error];
-    if (error)
-      NSLog(@"Failed to create render pipeline state: %@", error);
-
-    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-    desc.label = @"Simple Pipeline";
-    desc.vertexFunction = vertexFunction;
-    desc.fragmentFunction = fragmentFunction;
-    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRG16Float;
-    motionVectorSearchRenderPipelineState = [device newRenderPipelineStateWithDescriptor:desc
-                                                                 error:&error];
-    if (error)
-      NSLog(@"Failed to create render pipeline state: %@", error);
-    CHECK(motionVectorSearchRenderPipelineState);
-  }
-
-  {
     id<MTLFunction> vertexFunction = [library newFunctionWithName:@"motionVectorDrawVertexShader"];
     id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"motionVectorDrawFragmentShader"];
 
@@ -307,55 +376,6 @@ void ComputeMotionVectors(unsigned int block_width, unsigned int block_height) {
     ];
     [encoder endEncoding];
   }
-  [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-    CFTimeInterval executionDuration = cb.GPUEndTime - cb.GPUStartTime;
-    NSLog(@"Execution time: %f", executionDuration);
-  }];
-  [commandBuffer commit];
-}
-
-void ComputeMotionVectorUsingDraw() {
-  id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-
-  id<MTLRenderCommandEncoder> encoder = nil;
-  {
-    MTLRenderPassDescriptor* desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    desc.colorAttachments[0].texture = motion_vector_texture;
-    desc.colorAttachments[0].loadAction = MTLLoadActionClear;
-    desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    desc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-    encoder = [commandBuffer renderCommandEncoderWithDescriptor:desc];
-  }
-
-  {
-    MTLViewport viewport;
-    viewport.originX = 0;
-    viewport.originY = 0;
-    viewport.width = width / kBlockWidth;
-    viewport.height = height / kBlockHeight;
-    viewport.znear = -1.0;
-    viewport.zfar = 1.0;
-    [encoder setViewport:viewport];
-    [encoder setRenderPipelineState:motionVectorSearchRenderPipelineState];
-    vector_float2 positions[6] = {
-      {  1,  -1 }, { -1,  -1 }, {  1,   1 },
-      {  1,   1 }, { -1,   1 }, { -1,  -1 },
-    };
-    [encoder setVertexBytes:positions
-                     length:sizeof(positions)
-                    atIndex:0];
-    uint32_t size[2] = {width, height};
-    [encoder setVertexBytes:size
-                     length:sizeof(size)
-                    atIndex:1];
-    [encoder setFragmentTexture:frames[frame_index] atIndex:0];
-    [encoder setFragmentTexture:frames[previous_frame_index] atIndex:1];
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                vertexStart:0
-                vertexCount:6];
-  }
-  [encoder endEncoding];
-
   [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
     CFTimeInterval executionDuration = cb.GPUEndTime - cb.GPUStartTime;
     NSLog(@"Execution time: %f", executionDuration);
@@ -476,7 +496,6 @@ void Draw() {
           frame_index,
           (frame_index + frames.size() - 1) % frames.size());
       ComputeMotionVectors(kBlockWidth, kBlockHeight);
-      // ComputeMotionVectorUsingDraw();
       Draw();
       break;
     case 'p':
@@ -616,10 +635,11 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < max_frame_count; ++i) {
       std::stringstream buffer;
       buffer << "./complex/" << std::setfill('0') << std::setw(2) << i << ".png";
-      IOSurfaceRef io_surface = LoadImageToIOSurface(buffer.str().c_str(), false);
+      IOSurfaceRef io_surface = LoadImageToIOSurface(buffer.str().c_str(), true);
       if (!io_surface) {
         break;
       }
+      io_surfaces.push_back(io_surface);
       frames.push_back(IOSurfaceToTexture(io_surface));
     }
   }
@@ -647,7 +667,15 @@ int main(int argc, char* argv[]) {
 
   LoadShaders();
 
-  [[window contentView] setLayer:metalLayer];
+  if (0) {
+    // Visualize IOSurface directly
+    CALayer* x = [[CALayer alloc] init];
+    [x setContents:(__bridge id)io_surfaces[0]];
+    [[window contentView] setLayer:x];
+  } else {
+    [[window contentView] setLayer:metalLayer];
+  }
+  
   [[window contentView] setWantsLayer:YES];
 
   [window setTitle:@"Tiny Metal App"];

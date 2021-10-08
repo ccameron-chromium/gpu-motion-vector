@@ -55,6 +55,7 @@ kernel void motionVectorSearch(
     uint y = flat_idx / TileSize.x;
     uint x = flat_idx - y * TileSize.x;
     int2 global_idx = tile_origin + int2(x, y);
+    global_idx.y = previous.get_height() - global_idx.y;
     tile_data[flat_idx] = previous.read(uint2(clamp(
         global_idx,
         int2(0,0),
@@ -70,6 +71,7 @@ kernel void motionVectorSearch(
         block_origin + uint2(bx, by),
         uint2(frame.get_width() - 1, frame.get_height() - 1)
       );
+      global_idx.y = previous.get_height() - global_idx.y;
       frame_block_data[by * kBlockSize.x + bx] = frame.read(global_idx)[0];
     }
   }
